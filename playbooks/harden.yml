@@ -1,0 +1,278 @@
+---
+- name: Harden all managed hosts
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - ../group_vars/all/vault.yml
+
+  handlers:
+    - name: restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+    - name: restart fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
+
+    - name: apply sysctl
+      ansible.builtin.command:
+        cmd: sysctl --system
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # SSH HARDENING
+    # -------------------------------------------------------------------------
+
+    - name: Harden sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?PermitRootLogin',        line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication',  line: 'PasswordAuthentication no' }
+        - { regexp: '^#?MaxAuthTries',            line: 'MaxAuthTries 3' }
+        - { regexp: '^#?LoginGraceTime',          line: 'LoginGraceTime 30' }
+        - { regexp: '^#?AllowTcpForwarding',      line: 'AllowTcpForwarding no' }
+        - { regexp: '^#?X11Forwarding',           line: 'X11Forwarding no' }
+        - { regexp: '^#?ClientAliveInterval',     line: 'ClientAliveInterval 300' }
+        - { regexp: '^#?ClientAliveCountMax',     line: 'ClientAliveCountMax 2' }
+      notify: restart sshd
+      tags: ['ssh', 'harden']
+
+    # -------------------------------------------------------------------------
+    # FAIL2BAN
+    # -------------------------------------------------------------------------
+
+    - name: Install fail2ban
+      ansible.builtin.package:
+        name: fail2ban
+        state: present
+      tags: ['fail2ban', 'harden']
+
+    - name: Deploy fail2ban jail config
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.d/homelab.conf
+        content: |
+          [DEFAULT]
+          bantime  = 3600
+          findtime = 600
+          maxretry = 3
+          backend  = systemd
+
+          [sshd]
+          enabled  = true
+          port     = ssh
+          logpath  = %(sshd_log)s
+          maxretry = 3
+          bantime  = 86400
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart fail2ban
+      tags: ['fail2ban', 'harden']
+
+    - name: Enable and start fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: started
+        enabled: true
+      tags: ['fail2ban', 'harden']
+
+    # -------------------------------------------------------------------------
+    # UNATTENDED UPGRADES
+    # -------------------------------------------------------------------------
+
+    - name: Install unattended-upgrades
+      ansible.builtin.package:
+        name:
+          - unattended-upgrades
+          - apt-listchanges
+        state: present
+      tags: ['updates', 'harden']
+
+    - name: Configure unattended-upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        content: |
+          Unattended-Upgrade::Allowed-Origins {
+              "${distro_id}:${distro_codename}-security";
+          };
+          Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+          Unattended-Upgrade::MinimalSteps "true";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+          Unattended-Upgrade::Automatic-Reboot "false";
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ['updates', 'harden']
+
+    - name: Enable automatic updates schedule
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Download-Upgradeable-Packages "1";
+          APT::Periodic::AutocleanInterval "7";
+          APT::Periodic::Unattended-Upgrade "1";
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ['updates', 'harden']
+
+    - name: Enable unattended-upgrades service
+      ansible.builtin.service:
+        name: unattended-upgrades
+        state: started
+        enabled: true
+      tags: ['updates', 'harden']
+
+    # -------------------------------------------------------------------------
+    # ROOT LOCK & SUDOERS
+    # -------------------------------------------------------------------------
+
+    - name: Lock root password
+      ansible.builtin.user:
+        name: root
+        password_lock: true
+      tags: ['access', 'harden']
+
+    - name: Configure sudoers for demarzo
+      ansible.builtin.lineinfile:
+        path: /etc/sudoers.d/demarzo
+        line: 'demarzo ALL=(ALL) NOPASSWD:ALL'
+        create: true
+        validate: 'visudo -cf %s'
+        mode: '0440'
+      tags: ['access', 'harden']
+
+    - name: Restrict su to sudo group only
+      ansible.builtin.lineinfile:
+        path: /etc/pam.d/su
+        regexp: '^#auth.*required.*pam_wheel'
+        line: 'auth required pam_wheel.so'
+        state: present
+      tags: ['access', 'harden']
+
+    - name: Set secure umask
+      ansible.builtin.lineinfile:
+        path: /etc/login.defs
+        regexp: '^UMASK'
+        line: 'UMASK 027'
+      tags: ['access', 'harden']
+
+    # -------------------------------------------------------------------------
+    # KERNEL HARDENING
+    # -------------------------------------------------------------------------
+
+    - name: Deploy kernel hardening sysctl
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-harden.conf
+        content: |
+          # IP Spoofing protection
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.conf.default.rp_filter = 1
+
+          # Ignore ICMP redirects
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+
+          # Ignore ping broadcasts
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+          # SYN flood protection
+          net.ipv4.tcp_syncookies = 1
+
+          # Log suspicious packets
+          net.ipv4.conf.all.log_martians = 1
+          net.ipv4.conf.default.log_martians = 1
+
+          # Disable IP source routing
+          net.ipv4.conf.all.accept_source_route = 0
+          net.ipv4.conf.default.accept_source_route = 0
+
+          # Protect against time-wait assassination
+          net.ipv4.tcp_rfc1337 = 1
+
+          # Kernel pointer restriction
+          kernel.kptr_restrict = 2
+
+          # Restrict dmesg to root
+          kernel.dmesg_restrict = 1
+
+          # Restrict ptrace
+          kernel.yama.ptrace_scope = 1
+        owner: root
+        group: root
+        mode: '0644'
+      when: inventory_hostname not in groups['lxc']
+      notify: apply sysctl
+      tags: ['kernel', 'harden']
+
+    # -------------------------------------------------------------------------
+    # VERIFICATION & SUMMARY
+    # -------------------------------------------------------------------------
+
+    - name: Verify root login is disabled
+      ansible.builtin.command:
+        cmd: grep "^PermitRootLogin no" /etc/ssh/sshd_config
+      register: root_login_check
+      changed_when: false
+      failed_when: root_login_check.rc != 0
+      tags: ['verify', 'harden']
+
+    - name: Verify password auth is disabled
+      ansible.builtin.command:
+        cmd: grep "^PasswordAuthentication no" /etc/ssh/sshd_config
+      register: password_auth_check
+      changed_when: false
+      failed_when: password_auth_check.rc != 0
+      tags: ['verify', 'harden']
+
+    - name: Verify fail2ban is running
+      ansible.builtin.service:
+        name: fail2ban
+        state: started
+      register: fail2ban_check
+      tags: ['verify', 'harden']
+
+    - name: Verify demarzo sudo access
+      ansible.builtin.command:
+        cmd: sudo -l -U demarzo
+      register: sudo_check
+      changed_when: false
+      tags: ['verify', 'harden']
+
+    - name: Log hardening completion
+      ansible.builtin.copy:
+        dest: /var/log/homelab/harden.log
+        content: |
+          Hardening completed: {{ ansible_date_time.iso8601 }}
+          Host:               {{ inventory_hostname }}
+          OS:                 {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Type:               {{ 'LXC' if inventory_hostname in groups['lxc'] else 'VM/Bare Metal' }}
+          Root login:         disabled
+          Password auth:      disabled
+          fail2ban:           running
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ['verify', 'harden']
+
+    - name: Hardening summary
+      ansible.builtin.debug:
+        msg:
+          - "Host:            {{ inventory_hostname }}"
+          - "OS:              {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Type:            {{ 'LXC' if inventory_hostname in groups['lxc'] else 'VM/Bare Metal' }}"
+          - "Root login:      {{ 'DISABLED' if root_login_check.rc == 0 else 'FAILED' }}"
+          - "Password auth:   {{ 'DISABLED' if password_auth_check.rc == 0 else 'FAILED' }}"
+          - "fail2ban:        {{ 'RUNNING' if fail2ban_check else 'FAILED' }}"
+      tags: ['verify', 'harden']

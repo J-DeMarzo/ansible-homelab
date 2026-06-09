@@ -1,0 +1,431 @@
+---
+- name: Bootstrap all managed hosts
+  hosts: all
+  remote_user: root
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - ../group_vars/all/vault.yml
+
+  vars:
+    lab_domain: demarzo.lab
+    lab_dns_primary: 10.12.5.53
+    lab_dns_port: 5380
+    ansible_python_interpreter: /usr/bin/python3
+
+  handlers:
+    - name: apply sysctl
+      ansible.builtin.command:
+        cmd: sysctl --system
+
+    - name: restart rsyslog
+      ansible.builtin.service:
+        name: rsyslog
+        state: restarted
+
+    - name: restart auditd
+      ansible.builtin.service:
+        name: auditd
+        state: restarted
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # PRE-FLIGHT CHECKS
+    # -------------------------------------------------------------------------
+
+    - name: Verify Ansible version
+      ansible.builtin.assert:
+        that:
+          - ansible_version.full is version('2.14', '>=')
+        fail_msg: "Ansible 2.14+ required — current version: {{ ansible_version.full }}"
+      tags: ['preflight', 'bootstrap']
+
+    - name: Verify host is reachable
+      ansible.builtin.ping:
+      tags: ['preflight', 'bootstrap']
+
+    - name: Verify Python3 is available
+      ansible.builtin.raw: python3 --version
+      register: python_check
+      changed_when: false
+      failed_when: python_check.rc != 0
+      tags: ['preflight', 'bootstrap']
+
+    # -------------------------------------------------------------------------
+    # TIMEZONE & CLOCK
+    # -------------------------------------------------------------------------
+
+    - name: Set timezone
+      community.general.timezone:
+        name: America/Chicago
+      tags: ['clock', 'bootstrap']
+
+    - name: Install chrony
+      ansible.builtin.package:
+        name: chrony
+        state: present
+      tags: ['clock', 'bootstrap']
+
+    - name: Enable and start chrony
+      ansible.builtin.service:
+        name: chrony
+        state: started
+        enabled: true
+      when: inventory_hostname not in groups['lxc']
+      tags: ['clock', 'bootstrap']
+
+    # -------------------------------------------------------------------------
+    # HOST IDENTITY
+    # -------------------------------------------------------------------------
+
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+      tags: ['identity', 'bootstrap']
+
+    - name: Configure /etc/hosts
+      ansible.builtin.template:
+        src: templates/hosts.j2
+        dest: /etc/hosts
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ['identity', 'bootstrap']
+
+    - name: Register A record in Technitium DNS
+      ansible.builtin.uri:
+        url: "http://{{ lab_dns_primary }}:{{ lab_dns_port }}/api/zones/records/add"
+        method: GET
+        headers:
+          Authorization: "token {{ vault_technitium_token }}"
+        body_format: form-urlencoded
+        body:
+          domain: "{{ lab_domain }}"
+          zone: "{{ lab_domain }}"
+          type: "A"
+          ttl: "3600"
+          name: "{{ inventory_hostname }}"
+          ipAddress: "{{ ansible_host }}"
+          overwrite: "true"
+      delegate_to: localhost
+      become: false
+      tags: ['dns', 'identity', 'bootstrap']
+
+    - name: Register PTR record in Technitium DNS
+      ansible.builtin.uri:
+        url: "http://{{ lab_dns_primary }}:{{ lab_dns_port }}/api/zones/records/add"
+        method: GET
+        headers:
+          Authorization: "token {{ vault_technitium_token }}"
+        body_format: form-urlencoded
+        body:
+          type: "PTR"
+          ttl: "3600"
+          name: "{{ ansible_host }}"
+          ptrName: "{{ inventory_hostname }}.{{ lab_domain }}"
+          overwrite: "true"
+      delegate_to: localhost
+      become: false
+      tags: ['dns', 'identity', 'bootstrap']
+
+    # -------------------------------------------------------------------------
+    # PACKAGE BASELINE
+    # -------------------------------------------------------------------------
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      tags: ['packages', 'bootstrap']
+
+    - name: Apply pending security patches
+      ansible.builtin.apt:
+        upgrade: safe
+      tags: ['packages', 'bootstrap']
+
+    - name: Install baseline packages
+      ansible.builtin.package:
+        name:
+          - curl
+          - wget
+          - vim
+          - htop
+          - net-tools
+          - tcpdump
+          - rsync
+          - ca-certificates
+          - python3
+          - rsyslog
+          - sudo
+        state: present
+      tags: ['packages', 'bootstrap']
+
+    # -------------------------------------------------------------------------
+    # IDENTITY & ACCESS
+    # -------------------------------------------------------------------------
+
+    - name: Ensure sudo group exists
+      ansible.builtin.group:
+        name: sudo
+        state: present
+      tags: ['access', 'bootstrap']
+
+    - name: Create demarzo user
+      ansible.builtin.user:
+        name: demarzo
+        password: "{{ vault_demarzo_password | password_hash('sha512') }}"
+        groups: sudo
+        shell: /bin/bash
+        create_home: true
+        state: present
+      tags: ['access', 'bootstrap']
+
+    - name: Deploy Ansible SSH key to demarzo
+      ansible.posix.authorized_key:
+        user: demarzo
+        key: "{{ lookup('file', '~/.ssh/ansible_ed25519.pub') }}"
+        state: present
+      tags: ['access', 'bootstrap']
+
+    - name: Create node-exporter service account
+      ansible.builtin.user:
+        name: node-exporter
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        state: present
+      tags: ['access', 'bootstrap']
+
+    - name: Create wazuh service account
+      ansible.builtin.user:
+        name: wazuh
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        state: present
+      tags: ['access', 'bootstrap']
+
+    - name: Configure PAM password policy
+      ansible.builtin.copy:
+        dest: /etc/security/pwquality.conf
+        content: |
+          minlen = 12
+          minclass = 3
+          maxrepeat = 3
+          gecoscheck = 1
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ['access', 'bootstrap']
+
+    - name: Add demarzo as Proxmox admin user
+      ansible.builtin.command:
+        cmd: pveum user add demarzo@pam
+      ignore_errors: true
+      when: inventory_hostname in groups['proxmox']
+      tags: ['access', 'bootstrap']
+
+    - name: Assign Administrator role to demarzo in Proxmox
+      ansible.builtin.command:
+        cmd: pveum acl modify / -user demarzo@pam -role Administrator
+      when: inventory_hostname in groups['proxmox']
+      tags: ['access', 'bootstrap']
+
+    # -------------------------------------------------------------------------
+    # SSH & LXC-SPECIFIC HANDLING
+    # -------------------------------------------------------------------------
+
+    - name: Install openssh-server on LXC containers
+      ansible.builtin.package:
+        name: openssh-server
+        state: present
+      when: inventory_hostname in groups['lxc']
+      tags: ['ssh', 'lxc', 'bootstrap']
+
+    - name: Ensure SSH is enabled and running
+      ansible.builtin.service:
+        name: ssh
+        state: started
+        enabled: true
+      tags: ['ssh', 'bootstrap']
+
+    - name: Install qemu-guest-agent on VMs and bare metal
+      ansible.builtin.package:
+        name: qemu-guest-agent
+        state: present
+      when: inventory_hostname in groups['vms'] or
+            inventory_hostname in groups['media']
+      tags: ['vm', 'bootstrap']
+
+    - name: Enable qemu-guest-agent on VMs and bare metal
+      ansible.builtin.service:
+        name: qemu-guest-agent
+        state: started
+        enabled: true
+      when: inventory_hostname in groups['vms'] or
+            inventory_hostname in groups['media']
+      tags: ['vm', 'bootstrap']
+
+    - name: Apply sysctl hardening on VMs and bare metal
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-homelab.conf
+        content: |
+          # Network hardening
+          net.ipv4.tcp_syncookies = 1
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+        owner: root
+        group: root
+        mode: '0644'
+      when: inventory_hostname not in groups['lxc']
+      notify: apply sysctl
+      tags: ['sysctl', 'bootstrap']
+
+    - name: Disable IPv6 on all hosts
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-disable-ipv6.conf
+        content: |
+          net.ipv6.conf.all.disable_ipv6 = 1
+          net.ipv6.conf.default.disable_ipv6 = 1
+        owner: root
+        group: root
+        mode: '0644'
+      notify: apply sysctl
+      tags: ['sysctl', 'bootstrap']
+
+    # -------------------------------------------------------------------------
+    # LOGGING READINESS
+    # -------------------------------------------------------------------------
+
+    - name: Ensure rsyslog is running
+      ansible.builtin.service:
+        name: rsyslog
+        state: started
+        enabled: true
+      tags: ['logging', 'bootstrap']
+
+    - name: Deploy rsyslog base config
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/49-homelab.conf
+        content: |
+          # Log auth messages separately
+          auth,authpriv.*                 /var/log/auth.log
+          # Log cron
+          cron.*                          /var/log/cron.log
+          # Discard noisy messages
+          & stop
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart rsyslog
+      tags: ['logging', 'bootstrap']
+
+    - name: Install auditd on VMs and bare metal
+      ansible.builtin.package:
+        name:
+          - auditd
+          - audispd-plugins
+        state: present
+      when: inventory_hostname not in groups['lxc']
+      tags: ['logging', 'audit', 'bootstrap']
+
+    - name: Deploy auditd rules
+      ansible.builtin.copy:
+        dest: /etc/audit/rules.d/homelab.rules
+        content: |
+          # Identity changes
+          -w /etc/passwd -p wa -k identity
+          -w /etc/group -p wa -k identity
+          -w /etc/shadow -p wa -k identity
+          -w /etc/sudoers -p wa -k sudoers
+
+          # SSH activity
+          -w /etc/ssh/sshd_config -p wa -k sshd_config
+
+          # Authentication logs
+          -w /var/log/auth.log -p ra -k auth_log
+
+          # Privileged command execution
+          -a always,exit -F arch=b64 -S execve -F euid=0 -k root_commands
+        owner: root
+        group: root
+        mode: '0640'
+      when: inventory_hostname not in groups['lxc']
+      notify: restart auditd
+      tags: ['logging', 'audit', 'bootstrap']
+
+    - name: Enable auditd on VMs and bare metal
+      ansible.builtin.service:
+        name: auditd
+        state: started
+        enabled: true
+      when: inventory_hostname not in groups['lxc']
+      tags: ['logging', 'audit', 'bootstrap']
+
+    # -------------------------------------------------------------------------
+    # VERIFICATION & SUMMARY
+    # -------------------------------------------------------------------------
+
+    - name: Create standard log directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /var/log/homelab
+        - /var/log/ansible
+      tags: ['verify', 'bootstrap']
+
+    - name: Log bootstrap completion
+      ansible.builtin.copy:
+        dest: /var/log/homelab/bootstrap.log
+        content: |
+          Bootstrap completed: {{ ansible_date_time.iso8601 }}
+          Host:               {{ inventory_hostname }}
+          Ansible user:       {{ ansible_user_id }}
+          OS:                 {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Type:               {{ 'LXC' if inventory_hostname in groups['lxc'] else 'VM/Bare Metal' }}
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ['verify', 'bootstrap']
+
+    - name: Verify demarzo user exists
+      ansible.builtin.getent:
+        database: passwd
+        key: demarzo
+      register: demarzo_check
+      tags: ['verify', 'bootstrap']
+
+    - name: Verify SSH is listening
+      ansible.builtin.wait_for:
+        port: 22
+        host: "{{ ansible_host }}"
+        timeout: 10
+      delegate_to: localhost
+      become: false
+      tags: ['verify', 'bootstrap']
+
+    - name: Verify DNS resolution
+      ansible.builtin.command:
+        cmd: "getent hosts darrow.{{ lab_domain }}"
+      register: dns_check
+      changed_when: false
+      failed_when: dns_check.rc != 0
+      tags: ['verify', 'bootstrap']
+
+    - name: Bootstrap summary
+      ansible.builtin.debug:
+        msg:
+          - "Host:         {{ inventory_hostname }}"
+          - "OS:           {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Type:         {{ 'LXC' if inventory_hostname in groups['lxc'] else 'VM/Bare Metal' }}"
+          - "demarzo user: {{ 'OK' if demarzo_check else 'MISSING' }}"
+          - "DNS:          {{ 'OK' if dns_check.rc == 0 else 'FAILED' }}"
+      tags: ['verify', 'bootstrap']
