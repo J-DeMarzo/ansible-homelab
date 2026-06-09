@@ -1,6 +1,15 @@
-skip_list:
-  - no-free-form
-  - yaml[truthy]
-
-exclude_paths:
-  - group_vars/
+name: Ansible Lint
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ansible-lint
+        run: pip install ansible-lint
+      - name: Run ansible-lint
+        run: ansible-lint --exclude group_vars playbooks/
+        env:
+          ANSIBLE_VAULT_PASSWORD_FILE: /dev/null
