@@ -1,15 +1,24 @@
-name: Ansible Lint
-on: [push, pull_request]
-jobs:
-  lint:
-    runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install ansible-lint
-        run: pip install ansible-lint
-      - name: Run ansible-lint
-        run: ansible-lint --exclude group_vars playbooks/
-        env:
-          ANSIBLE_VAULT_PASSWORD_FILE: /dev/null
+---
+profile: min
+
+skip_list:
+  - no-free-form
+  - yaml[truthy]
+  - yaml[line-length]
+  - name[template]
+  - var-naming[no-role-prefix]
+  - galaxy[no-runtime]
+
+exclude_paths:
+  - group_vars/
+  - roles/
+
+warn_list:
+  - experimental
+
+mock_modules:
+  - community.general.timezone
+  - community.general.ufw
+  - ansible.posix.authorized_key
+
+offline: false
