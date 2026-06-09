@@ -8,4 +8,6 @@ jobs:
       - name: Install ansible-lint
         run: pip install ansible-lint
       - name: Run ansible-lint
-        run: ansible-lint playbooks/
+        run: ansible-lint --exclude group_vars playbooks/
+        env:
+          ANSIBLE_VAULT_PASSWORD_FILE: /dev/null

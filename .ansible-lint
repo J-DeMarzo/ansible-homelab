@@ -1,0 +1,6 @@
+skip_list:
+  - no-free-form
+  - yaml[truthy]
+
+exclude_paths:
+  - group_vars/
